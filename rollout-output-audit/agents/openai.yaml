@@ -1,0 +1,4 @@
+interface:
+  display_name: "Rollout Output Audit"
+  short_description: "Find tool output that inflates Codex context"
+  default_prompt: "Use $rollout-output-audit to audit recent Codex session rollouts and recommend AGENTS.md rules to reduce large tool output."

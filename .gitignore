@@ -6,6 +6,9 @@
 !.gitignore
 !README.md
 
+!/rollout-output-audit/
+!/rollout-output-audit/**
+
 # Always ignore local/runtime artifacts, even inside allowlisted skills.
 **/__pycache__/
 *.py[cod]
