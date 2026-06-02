@@ -1,0 +1,12 @@
+# Publish allowlist.
+# Ignore everything by default, then explicitly allow files/skills to publish.
+
+/*
+
+!.gitignore
+!README.md
+
+# Always ignore local/runtime artifacts, even inside allowlisted skills.
+**/__pycache__/
+*.py[cod]
+.DS_Store
