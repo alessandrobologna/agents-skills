@@ -24,6 +24,9 @@ SECRET_RE = re.compile(
     r"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|bearer|password|secret|token)=([^\s'\";]+)"
 )
 BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
+SESSION_ID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
 DEFAULT_MODEL = "gpt-5.3-codex"
 OPENAI_CODEX_RATE_SOURCE = "https://help.openai.com/en/articles/20001106"
 OPENAI_API_RATE_SOURCE = (
@@ -179,15 +182,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--analysis",
-        choices=("tool-output", "compactions"),
+        choices=("tool-output", "compactions", "both"),
         default="tool-output",
-        help="Analyze large tool outputs or compaction cost around compact events.",
+        help="Analyze large tool outputs, compaction cost, or both.",
     )
     parser.add_argument(
         "--scope",
         choices=("current-cwd", "cwd", "global"),
-        required=True,
-        help="Audit current cwd sessions, a named cwd, or all sessions.",
+        default="current-cwd",
+        help="Audit current cwd sessions, a named cwd, or all sessions. Defaults to current-cwd.",
     )
     parser.add_argument(
         "--cwd",
@@ -200,6 +203,18 @@ def parse_args() -> argparse.Namespace:
         help="Root containing Codex rollout JSONL files.",
     )
     parser.add_argument(
+        "--session-id",
+        action="append",
+        default=[],
+        help="Audit only the rollout with this session id. Repeat to audit more than one session.",
+    )
+    parser.add_argument(
+        "--rollout-path",
+        action="append",
+        default=[],
+        help="Audit only this rollout JSONL file. Repeat to audit more than one file.",
+    )
+    parser.add_argument(
         "--since-days",
         type=int,
         default=30,
@@ -209,7 +224,7 @@ def parse_args() -> argparse.Namespace:
         "--top",
         type=int,
         default=20,
-        help="Maximum top findings to print.",
+        help="Maximum top findings to print. Use 0 for all records.",
     )
     parser.add_argument(
         "--large-output-tokens",
@@ -255,7 +270,10 @@ def parse_args() -> argparse.Namespace:
         default=8,
         help="Real token_count turns to show after each compaction.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.top < 0:
+        parser.error("--top must be greater than or equal to 0")
+    return args
 
 
 def load_json_object(line: str) -> dict[str, Any] | None:
@@ -444,6 +462,60 @@ def find_rollout_paths(root: Path, since_days: int) -> list[Path]:
             continue
         paths.append(path)
     return sorted(paths, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def rollout_session_id(path: Path) -> str | None:
+    match = SESSION_ID_RE.search(path.name)
+    if not match:
+        return None
+    return match.group(0).lower()
+
+
+def unique_paths(paths: list[Path]) -> list[Path]:
+    seen: set[Path] = set()
+    unique = []
+    for path in paths:
+        try:
+            key = path.expanduser().resolve()
+        except OSError:
+            key = path.expanduser()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(key)
+    return sorted(unique, key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+
+
+def selected_rollout_paths(args: argparse.Namespace, root: Path) -> tuple[list[Path], list[str]]:
+    selected: list[Path] = []
+    missing: list[str] = []
+
+    for value in args.rollout_path:
+        path = Path(value).expanduser()
+        if path.is_dir():
+            selected.extend(find_rollout_paths(path, since_days=0))
+        elif path.exists():
+            selected.append(path)
+        else:
+            missing.append(f"rollout path not found: {value}")
+
+    session_ids = {value.lower() for value in args.session_id}
+    if session_ids:
+        all_paths = find_rollout_paths(root, since_days=0)
+        matched_ids: set[str] = set()
+        for path in all_paths:
+            session_id = rollout_session_id(path)
+            if session_id in session_ids:
+                selected.append(path)
+                matched_ids.add(session_id)
+        for session_id in sorted(session_ids - matched_ids):
+            missing.append(f"session id not found: {session_id}")
+
+    if selected:
+        return unique_paths(selected), missing
+    if missing:
+        return [], missing
+    return find_rollout_paths(root, args.since_days), []
 
 
 def scan_rollout(path: Path, threshold_tokens: int, target_cwd: Path | None, include_global: bool) -> RolloutScan:
@@ -784,6 +856,26 @@ def average(values: list[float]) -> float | None:
     return sum(values) / len(values)
 
 
+def limited_items(items: list[Any], args: argparse.Namespace) -> list[Any]:
+    if args.top == 0:
+        return items
+    return items[: args.top]
+
+
+def exact_selector_active(args: argparse.Namespace) -> bool:
+    return bool(args.session_id or args.rollout_path)
+
+
+def scope_target_label(args: argparse.Namespace, target_cwd: Path | None) -> str:
+    if args.session_id:
+        return "session id " + ", ".join(f"`{session_id}`" for session_id in args.session_id)
+    if args.rollout_path:
+        return "rollout path " + ", ".join(f"`{path}`" for path in args.rollout_path)
+    if args.scope == "global":
+        return "all sessions"
+    return f"`{target_cwd}`"
+
+
 def scan_matches_scope(scan: RolloutScan, target_cwd: Path | None, include_global: bool) -> bool:
     if include_global:
         return True
@@ -791,7 +883,7 @@ def scan_matches_scope(scan: RolloutScan, target_cwd: Path | None, include_globa
 
 
 def scoped_scans(scans: list[RolloutScan], args: argparse.Namespace, target_cwd: Path | None) -> list[RolloutScan]:
-    include_global = args.scope == "global"
+    include_global = args.scope == "global" or exact_selector_active(args)
     return [scan for scan in scans if scan_matches_scope(scan, target_cwd, include_global)]
 
 
@@ -864,15 +956,23 @@ def compaction_analysis_record(
         "before": before,
         "after": after,
         "before_average_cost": before_avg_cost,
+        "before_avg_cost": before_avg_cost,
         "after_average_cost": after_avg_cost,
+        "after_avg_cost": after_avg_cost,
         "after_total_cost": after_total_cost,
         "projected_after_cost_without_compaction": projected_after_cost,
+        "projected_after_cost": projected_after_cost,
         "observed_savings": observed_savings,
+        "cost_delta": observed_savings,
         "break_even_after_turn": break_even_after_turn(before_avg_cost, after),
         "before_average_cached_tokens": token_average(before, "cached_input_tokens"),
+        "before_avg_cached_tokens": token_average(before, "cached_input_tokens"),
         "after_average_cached_tokens": token_average(after, "cached_input_tokens"),
+        "after_avg_cached_tokens": token_average(after, "cached_input_tokens"),
         "before_average_noncached_tokens": token_average(before, "noncached_input_tokens"),
+        "before_avg_noncached_tokens": token_average(before, "noncached_input_tokens"),
         "after_average_noncached_tokens": token_average(after, "noncached_input_tokens"),
+        "after_avg_noncached_tokens": token_average(after, "noncached_input_tokens"),
         "unit": rate.unit,
     }
 
@@ -890,6 +990,35 @@ def compaction_analysis_records(
             continue
         records.append(compaction_analysis_record(scan, compaction, args))
     return records
+
+
+def compaction_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    cost_deltas = [record["cost_delta"] for record in records if record["cost_delta"] is not None]
+    before_costs = [
+        record["before_average_cost"]
+        for record in records
+        if record["before_average_cost"] is not None
+    ]
+    after_costs = [
+        record["after_average_cost"]
+        for record in records
+        if record["after_average_cost"] is not None
+    ]
+    context_estimates = [
+        record["context_estimate_tokens"]
+        for record in records
+        if record["context_estimate_tokens"] is not None
+    ]
+    return {
+        "compactions_count": len(records),
+        "total_cost_delta": sum(cost_deltas) if cost_deltas else None,
+        "total_observed_savings": sum(cost_deltas) if cost_deltas else None,
+        "avg_before_cost": average(before_costs),
+        "avg_after_cost": average(after_costs),
+        "context_estimate_min": min(context_estimates) if context_estimates else None,
+        "context_estimate_max": max(context_estimates) if context_estimates else None,
+        "worse_after_count": sum(1 for value in cost_deltas if value < 0),
+    }
 
 
 def rate_entries_for_report(args: argparse.Namespace) -> list[RateEntry]:
@@ -948,6 +1077,7 @@ def report_markdown(
 ) -> str:
     matched_rollouts = sum(1 for scan in scans if scan.outputs)
     parse_errors = sum(scan.parse_errors for scan in scans)
+    shown_findings = limited_items(findings, args)
     pattern_counts: dict[str, int] = {}
     high_max_output_count = 0
     for finding in findings:
@@ -963,14 +1093,17 @@ def report_markdown(
     lines = [
         "# Rollout Output Audit",
         "",
-        f"- Scope: `{args.scope}`" + (f" (`{target_cwd}`)" if target_cwd else ""),
+        f"- Scope: `{args.scope}` ({scope_target_label(args, target_cwd)})",
         f"- Sessions root: `{Path(args.sessions_root).expanduser()}`",
         f"- Since days: `{args.since_days}`",
         f"- Rollout files scanned: `{len(scans)}`",
         f"- Rollouts with findings: `{matched_rollouts}`",
         f"- Findings above threshold: `{len(findings)}`",
+        f"- Findings shown: `{len(shown_findings)}`",
         f"- Large-output threshold: `{args.large_output_tokens:,}` approximate tokens",
     ]
+    if exact_selector_active(args):
+        lines.append("- Exact session/rollout selectors ignore the since-days window.")
     if parse_errors:
         lines.append(f"- JSONL parse errors skipped: `{parse_errors}`")
     if target:
@@ -983,9 +1116,10 @@ def report_markdown(
     else:
         lines.append("- No large retained outputs found for this scope/window.")
 
-    if findings:
-        lines.extend(["", f"## Top {min(args.top, len(findings))} Tool Outputs", ""])
-        for index, finding in enumerate(findings[: args.top], start=1):
+    if shown_findings:
+        heading = "All Tool Outputs" if args.top == 0 else f"Top {len(shown_findings)} Tool Outputs"
+        lines.extend(["", f"## {heading}", ""])
+        for index, finding in enumerate(shown_findings, start=1):
             command = compact_label(finding.command or finding.tool_name)
             cwd = compact_label(finding.workdir or finding.turn_cwd or "", limit=120)
             lines.extend(
@@ -1027,13 +1161,18 @@ def report_json(
             high_max_output_count += 1
 
     payload = {
+        "analysis": "tool-output",
         "scope": args.scope,
         "cwd": str(target_cwd) if target_cwd else None,
+        "session_ids": args.session_id,
+        "rollout_path_selectors": args.rollout_path,
+        "exact_selectors_ignore_since_days": exact_selector_active(args),
         "sessions_root": str(Path(args.sessions_root).expanduser()),
         "since_days": args.since_days,
         "rollout_files_scanned": len(scans),
         "rollouts_with_findings": sum(1 for scan in scans if scan.outputs),
         "findings_count": len(findings),
+        "findings_shown_count": len(limited_items(findings, args)),
         "large_output_threshold_tokens": args.large_output_tokens,
         "pattern_summary": pattern_counts,
         "recommended_rules": recommended_rules(pattern_counts, high_max_output_count),
@@ -1052,7 +1191,7 @@ def report_json(
                 "line_no": finding.line_no,
                 "next_token_usage": dataclasses.asdict(finding.next_usage) if finding.next_usage else None,
             }
-            for finding in findings[: args.top]
+            for finding in limited_items(findings, args)
         ],
     }
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
@@ -1066,9 +1205,9 @@ def report_compactions_markdown(
     scoped = scoped_scans(scans, args, target_cwd)
     parse_errors = sum(scan.parse_errors for scan in scans)
     records = compaction_analysis_records(scans, args, target_cwd)
-    shown = records[: args.top] if args.top > 0 else records
+    shown = limited_items(records, args)
     default_rate, _ = resolve_rate(None, args)
-    target = "all sessions" if args.scope == "global" else f"`{target_cwd}`"
+    target = scope_target_label(args, target_cwd)
 
     lines = [
         "# Rollout Compaction Cost Audit",
@@ -1079,9 +1218,12 @@ def report_compactions_markdown(
         f"- Rollout files scanned: `{len(scans)}`",
         f"- Rollouts matching scope: `{len(scoped)}`",
         f"- Compactions found: `{len(records)}`",
+        f"- Compactions shown: `{len(shown)}`",
         f"- Window: `{args.compaction_before}` real token_count turns before, `{args.compaction_after}` after",
         f"- Rate card: `{args.rate_card}`; model: `{args.model}`; default unknown model: `{DEFAULT_MODEL}`",
     ]
+    if exact_selector_active(args):
+        lines.append("- Exact session/rollout selectors ignore the since-days window.")
     if parse_errors:
         lines.append(f"- JSONL parse errors skipped: `{parse_errors}`")
     if any(record["model_assumed"] for record in records):
@@ -1104,7 +1246,8 @@ def report_compactions_markdown(
         lines.extend(["", "## Compactions", "", "No compaction events found for this scope/window."])
         return "\n".join(lines) + "\n"
 
-    lines.extend(["", f"## Compactions ({len(shown)} shown)", ""])
+    heading = "All Compactions" if args.top == 0 else f"Compactions ({len(shown)} shown)"
+    lines.extend(["", f"## {heading}", ""])
     for index, record in enumerate(shown, start=1):
         before_avg = record["before_average_cost"]
         after_avg = record["after_average_cost"]
@@ -1156,51 +1299,33 @@ def report_compactions_json(
     target_cwd: Path | None,
 ) -> str:
     records = compaction_analysis_records(scans, args, target_cwd)
+    shown = limited_items(records, args)
     payload = {
         "analysis": "compactions",
         "scope": args.scope,
         "cwd": str(target_cwd) if target_cwd else None,
+        "session_ids": args.session_id,
+        "rollout_path_selectors": args.rollout_path,
+        "exact_selectors_ignore_since_days": exact_selector_active(args),
         "sessions_root": str(Path(args.sessions_root).expanduser()),
         "since_days": args.since_days,
         "rollout_files_scanned": len(scans),
         "rollouts_matching_scope": len(scoped_scans(scans, args, target_cwd)),
         "compactions_count": len(records),
+        "compactions_shown_count": len(shown),
+        "summary": compaction_summary(records),
         "compaction_before": args.compaction_before,
         "compaction_after": args.compaction_after,
         "rate_card": args.rate_card,
         "model": args.model,
         "default_model": DEFAULT_MODEL,
         "rates_per_million": [dataclasses.asdict(entry) for entry in rate_entries_for_report(args)],
-        "compactions": records[: args.top] if args.top > 0 else records,
+        "compactions": shown,
     }
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
 
-def main() -> int:
-    args = parse_args()
-    sessions_root = Path(args.sessions_root).expanduser()
-    target_cwd = None
-    include_global = args.scope == "global"
-    if not include_global:
-        target_cwd = Path(args.cwd).expanduser().resolve()
-
-    paths = find_rollout_paths(sessions_root, args.since_days)
-    scans = [
-        scan_rollout(
-            path,
-            threshold_tokens=args.large_output_tokens,
-            target_cwd=target_cwd,
-            include_global=include_global,
-        )
-        for path in paths
-    ]
-    if args.analysis == "compactions":
-        if args.format == "json":
-            sys.stdout.write(report_compactions_json(scans, args, target_cwd))
-        else:
-            sys.stdout.write(report_compactions_markdown(scans, args, target_cwd))
-        return 0
-
+def sorted_findings(scans: list[RolloutScan]) -> list[OutputRecord]:
     findings = [output for scan in scans for output in scan.outputs]
     findings.sort(
         key=lambda item: (
@@ -1210,6 +1335,73 @@ def main() -> int:
         ),
         reverse=True,
     )
+    return findings
+
+
+def report_both_markdown(
+    scans: list[RolloutScan],
+    findings: list[OutputRecord],
+    args: argparse.Namespace,
+    target_cwd: Path | None,
+) -> str:
+    return (
+        report_markdown(scans, findings, args, target_cwd).rstrip()
+        + "\n\n---\n\n"
+        + report_compactions_markdown(scans, args, target_cwd)
+    )
+
+
+def report_both_json(
+    scans: list[RolloutScan],
+    findings: list[OutputRecord],
+    args: argparse.Namespace,
+    target_cwd: Path | None,
+) -> str:
+    payload = {
+        "analysis": "both",
+        "tool_output": json.loads(report_json(scans, findings, args, target_cwd)),
+        "compactions": json.loads(report_compactions_json(scans, args, target_cwd)),
+    }
+    return json.dumps(payload, indent=2, sort_keys=True) + "\n"
+
+
+def main() -> int:
+    args = parse_args()
+    sessions_root = Path(args.sessions_root).expanduser()
+    target_cwd = None
+    include_global = args.scope == "global" or exact_selector_active(args)
+    if not include_global:
+        target_cwd = Path(args.cwd).expanduser().resolve()
+
+    paths, missing = selected_rollout_paths(args, sessions_root)
+    if missing:
+        for message in missing:
+            print(message, file=sys.stderr)
+        if not paths:
+            return 2
+    scans = [
+        scan_rollout(
+            path,
+            threshold_tokens=args.large_output_tokens,
+            target_cwd=target_cwd,
+            include_global=include_global,
+        )
+        for path in paths
+    ]
+    findings = sorted_findings(scans)
+    if args.analysis == "both":
+        if args.format == "json":
+            sys.stdout.write(report_both_json(scans, findings, args, target_cwd))
+        else:
+            sys.stdout.write(report_both_markdown(scans, findings, args, target_cwd))
+        return 0
+
+    if args.analysis == "compactions":
+        if args.format == "json":
+            sys.stdout.write(report_compactions_json(scans, args, target_cwd))
+        else:
+            sys.stdout.write(report_compactions_markdown(scans, args, target_cwd))
+        return 0
 
     if args.format == "json":
         sys.stdout.write(report_json(scans, findings, args, target_cwd))
