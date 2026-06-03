@@ -24,6 +24,42 @@ SECRET_RE = re.compile(
     r"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|bearer|password|secret|token)=([^\s'\";]+)"
 )
 BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
+DEFAULT_MODEL = "gpt-5.3-codex"
+OPENAI_CODEX_RATE_SOURCE = "https://help.openai.com/en/articles/20001106"
+OPENAI_API_RATE_SOURCE = (
+    "https://developers.openai.com/api/docs/models/gpt-5.5, "
+    "https://developers.openai.com/api/docs/models/gpt-5.4, "
+    "https://developers.openai.com/api/docs/models/gpt-5.3-codex"
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class RateEntry:
+    model: str
+    input_rate: float
+    cached_input_rate: float
+    output_rate: float
+    unit: str
+    source: str
+
+
+CODEX_CREDIT_RATES: dict[str, RateEntry] = {
+    "gpt-5.5": RateEntry("gpt-5.5", 125.0, 12.5, 750.0, "credits", "OpenAI Codex rate card, 2026-06-03"),
+    "gpt-5.4": RateEntry("gpt-5.4", 62.5, 6.25, 375.0, "credits", "OpenAI Codex rate card, 2026-06-03"),
+    "gpt-5.4-mini": RateEntry("gpt-5.4-mini", 18.75, 1.875, 113.0, "credits", "OpenAI Codex rate card, 2026-06-03"),
+    "gpt-5.3-codex": RateEntry("gpt-5.3-codex", 43.75, 4.375, 350.0, "credits", "OpenAI Codex rate card, 2026-06-03"),
+    "gpt-5.2": RateEntry("gpt-5.2", 43.75, 4.375, 350.0, "credits", "OpenAI Codex rate card, 2026-06-03"),
+    "gpt-5.2-codex": RateEntry("gpt-5.2-codex", 43.75, 4.375, 350.0, "credits", "OpenAI Codex rate card, 2026-06-03"),
+}
+
+API_USD_RATES: dict[str, RateEntry] = {
+    "gpt-5.5": RateEntry("gpt-5.5", 5.0, 0.5, 30.0, "USD", "OpenAI API model pricing, 2026-06-03"),
+    "gpt-5.4": RateEntry("gpt-5.4", 2.5, 0.25, 15.0, "USD", "OpenAI API model pricing, 2026-06-03"),
+    "gpt-5.4-mini": RateEntry("gpt-5.4-mini", 0.75, 0.075, 4.5, "USD", "OpenAI API model pricing, 2026-06-03"),
+    "gpt-5.3-codex": RateEntry("gpt-5.3-codex", 1.75, 0.175, 14.0, "USD", "OpenAI API model pricing, 2026-06-03"),
+    "gpt-5.2": RateEntry("gpt-5.2", 1.75, 0.175, 14.0, "USD", "OpenAI API model pricing, 2026-06-03"),
+    "gpt-5.2-codex": RateEntry("gpt-5.2-codex", 1.75, 0.175, 14.0, "USD", "OpenAI API model pricing, 2026-06-03"),
+}
 
 
 @dataclasses.dataclass
@@ -31,6 +67,7 @@ class TokenUsage:
     input_tokens: int | None = None
     cached_input_tokens: int | None = None
     output_tokens: int | None = None
+    reasoning_output_tokens: int | None = None
     total_tokens: int | None = None
     model_context_window: int | None = None
 
@@ -39,6 +76,39 @@ class TokenUsage:
         if self.input_tokens is None or self.cached_input_tokens is None:
             return None
         return max(0, self.input_tokens - self.cached_input_tokens)
+
+    @property
+    def is_real_turn(self) -> bool:
+        return any(
+            (value or 0) > 0
+            for value in (self.input_tokens, self.cached_input_tokens, self.output_tokens)
+        )
+
+
+@dataclasses.dataclass
+class UsageRecord:
+    rollout_path: Path
+    session_id: str | None
+    timestamp: str | None
+    line_no: int
+    usage: TokenUsage
+    model: str | None
+
+    @property
+    def is_real_turn(self) -> bool:
+        return self.usage.is_real_turn
+
+
+@dataclasses.dataclass
+class CompactionRecord:
+    rollout_path: Path
+    session_id: str | None
+    timestamp: str | None
+    line_no: int
+    marker: str
+    model: str | None
+    replacement_history_len: int | None = None
+    context_estimate_tokens: int | None = None
 
 
 @dataclasses.dataclass
@@ -99,11 +169,19 @@ class RolloutScan:
     cwds: list[str]
     outputs: list[OutputRecord]
     parse_errors: int
+    usages: list[UsageRecord] = dataclasses.field(default_factory=list)
+    compactions: list[CompactionRecord] = dataclasses.field(default_factory=list)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Audit Codex rollout JSONL files for large retained tool outputs."
+    )
+    parser.add_argument(
+        "--analysis",
+        choices=("tool-output", "compactions"),
+        default="tool-output",
+        help="Analyze large tool outputs or compaction cost around compact events.",
     )
     parser.add_argument(
         "--scope",
@@ -150,6 +228,32 @@ def parse_args() -> argparse.Namespace:
         choices=("none", "print-patch"),
         default="none",
         help="Print AGENTS.md patch suggestions; never edits files directly.",
+    )
+    parser.add_argument(
+        "--rate-card",
+        choices=("codex-credits", "api-usd"),
+        default="codex-credits",
+        help="Built-in rate table used for compaction cost estimates.",
+    )
+    parser.add_argument(
+        "--model",
+        default="auto",
+        help=f"Model for cost estimates. Use 'auto' to read turn_context, defaulting unknown turns to {DEFAULT_MODEL}.",
+    )
+    parser.add_argument("--input-rate", type=float, default=None, help="Override uncached input rate per 1M tokens.")
+    parser.add_argument("--cached-input-rate", type=float, default=None, help="Override cached input rate per 1M tokens.")
+    parser.add_argument("--output-rate", type=float, default=None, help="Override output rate per 1M tokens.")
+    parser.add_argument(
+        "--compaction-before",
+        type=int,
+        default=3,
+        help="Real token_count turns to show before each compaction.",
+    )
+    parser.add_argument(
+        "--compaction-after",
+        type=int,
+        default=8,
+        help="Real token_count turns to show after each compaction.",
     )
     return parser.parse_args()
 
@@ -288,6 +392,7 @@ def token_usage_from_payload(payload: dict[str, Any]) -> TokenUsage | None:
         input_tokens=int_or_none(usage.get("input_tokens")),
         cached_input_tokens=int_or_none(usage.get("cached_input_tokens")),
         output_tokens=int_or_none(usage.get("output_tokens")),
+        reasoning_output_tokens=int_or_none(usage.get("reasoning_output_tokens")),
         total_tokens=int_or_none(usage.get("total_tokens")),
         model_context_window=int_or_none(info.get("model_context_window")),
     )
@@ -346,11 +451,13 @@ def scan_rollout(path: Path, threshold_tokens: int, target_cwd: Path | None, inc
     session_cwd = None
     current_turn_id = None
     current_cwd = None
+    current_model = None
     cwds: list[str] = []
     calls: dict[str, ToolCall] = {}
     events: dict[str, ToolEvent] = {}
     outputs: list[OutputRecord] = []
-    token_events: list[tuple[int, TokenUsage]] = []
+    token_events: list[UsageRecord] = []
+    compactions: list[CompactionRecord] = []
     parse_errors = 0
 
     try:
@@ -381,7 +488,9 @@ def scan_rollout(path: Path, threshold_tokens: int, target_cwd: Path | None, inc
             if item_type == "turn_context":
                 turn_id = payload.get("turn_id")
                 cwd = payload.get("cwd")
+                model = payload.get("model")
                 current_turn_id = turn_id if isinstance(turn_id, str) else current_turn_id
+                current_model = model if isinstance(model, str) else current_model
                 if isinstance(cwd, str):
                     current_cwd = cwd
                     cwds.append(cwd)
@@ -391,10 +500,47 @@ def scan_rollout(path: Path, threshold_tokens: int, target_cwd: Path | None, inc
                 if payload.get("type") == "token_count":
                     usage = token_usage_from_payload(payload)
                     if usage:
-                        token_events.append((line_no, usage))
+                        token_events.append(
+                            UsageRecord(
+                                rollout_path=path,
+                                session_id=session_id,
+                                timestamp=timestamp,
+                                line_no=line_no,
+                                usage=usage,
+                                model=current_model,
+                            )
+                        )
+                if payload.get("type") == "context_compacted":
+                    compactions.append(
+                        CompactionRecord(
+                            rollout_path=path,
+                            session_id=session_id,
+                            timestamp=timestamp,
+                            line_no=line_no,
+                            marker="context_compacted",
+                            model=current_model,
+                        )
+                    )
                 call_id, event = event_from_payload(payload, line_no, timestamp)
                 if call_id and event:
                     events[call_id] = event
+                continue
+
+            if item_type == "compacted":
+                replacement_history = payload.get("replacement_history")
+                compactions.append(
+                    CompactionRecord(
+                        rollout_path=path,
+                        session_id=session_id,
+                        timestamp=timestamp,
+                        line_no=line_no,
+                        marker="compacted",
+                        model=current_model,
+                        replacement_history_len=len(replacement_history)
+                        if isinstance(replacement_history, list)
+                        else None,
+                    )
+                )
                 continue
 
             if item_type != "response_item":
@@ -481,9 +627,20 @@ def scan_rollout(path: Path, threshold_tokens: int, target_cwd: Path | None, inc
             )
 
     for output in outputs:
-        output.next_usage = next((usage for line_no, usage in token_events if line_no > output.line_no), None)
+        output.next_usage = next((record.usage for record in token_events if record.line_no > output.line_no), None)
 
-    return RolloutScan(path, session_id, sorted(set(cwds)), outputs, parse_errors)
+    for compaction in compactions:
+        estimate = next(
+            (
+                record.usage.total_tokens
+                for record in token_events
+                if record.line_no > compaction.line_no and not record.is_real_turn
+            ),
+            None,
+        )
+        compaction.context_estimate_tokens = estimate
+
+    return RolloutScan(path, session_id, sorted(set(cwds)), outputs, parse_errors, token_events, compactions)
 
 
 def nearest_agents_md(cwd: Path | None) -> Path | None:
@@ -519,6 +676,245 @@ def fmt_usage(usage: TokenUsage | None) -> str:
         f"total={fmt_int(usage.total_tokens)}",
     ]
     return "next token_count: " + ", ".join(parts)
+
+
+def fmt_float(value: float | None, *, precision: int = 4) -> str:
+    if value is None:
+        return "-"
+    return f"{value:,.{precision}f}"
+
+
+def normalize_model(model: str | None) -> str | None:
+    if not model:
+        return None
+    normalized = model.lower().replace("_", "-")
+    for known in sorted({*CODEX_CREDIT_RATES, *API_USD_RATES}, key=len, reverse=True):
+        if normalized == known or normalized.startswith(f"{known}-"):
+            return known
+    return normalized
+
+
+def rate_table(name: str) -> dict[str, RateEntry]:
+    return API_USD_RATES if name == "api-usd" else CODEX_CREDIT_RATES
+
+
+def resolve_rate(model: str | None, args: argparse.Namespace) -> tuple[RateEntry, bool]:
+    table = rate_table(args.rate_card)
+    requested_model = None if args.model == "auto" else args.model
+    model_key = normalize_model(requested_model or model) or DEFAULT_MODEL
+    assumed = model_key not in table
+    base = table.get(model_key) or table[DEFAULT_MODEL]
+    if any(
+        override is not None
+        for override in (args.input_rate, args.cached_input_rate, args.output_rate)
+    ):
+        return (
+            RateEntry(
+                model=base.model,
+                input_rate=args.input_rate if args.input_rate is not None else base.input_rate,
+                cached_input_rate=args.cached_input_rate
+                if args.cached_input_rate is not None
+                else base.cached_input_rate,
+                output_rate=args.output_rate if args.output_rate is not None else base.output_rate,
+                unit=base.unit,
+                source=f"{base.source}; command-line overrides applied",
+            ),
+            assumed,
+        )
+    return base, assumed
+
+
+def estimate_cost(usage: TokenUsage, rate: RateEntry) -> float:
+    input_tokens = usage.input_tokens or 0
+    cached_tokens = usage.cached_input_tokens or 0
+    noncached_tokens = max(0, input_tokens - cached_tokens)
+    output_tokens = usage.output_tokens or 0
+    return (
+        noncached_tokens * rate.input_rate
+        + cached_tokens * rate.cached_input_rate
+        + output_tokens * rate.output_rate
+    ) / 1_000_000
+
+
+def coalesced_compactions(scans: list[RolloutScan]) -> list[CompactionRecord]:
+    compactions: list[CompactionRecord] = []
+    for scan in scans:
+        durable_lines = [item.line_no for item in scan.compactions if item.marker == "compacted"]
+        for item in scan.compactions:
+            if item.marker == "context_compacted" and any(
+                0 < item.line_no - durable_line <= 5 for durable_line in durable_lines
+            ):
+                continue
+            compactions.append(item)
+    return sorted(compactions, key=lambda item: (str(item.rollout_path), item.line_no))
+
+
+def real_usages_for_scan(scan: RolloutScan) -> list[UsageRecord]:
+    return [record for record in scan.usages if record.is_real_turn]
+
+
+def usage_cost_row(record: UsageRecord, rel: str, args: argparse.Namespace) -> dict[str, Any]:
+    rate, assumed = resolve_rate(record.model, args)
+    usage = record.usage
+    return {
+        "rel": rel,
+        "line_no": record.line_no,
+        "timestamp": record.timestamp,
+        "model": normalize_model(record.model) or rate.model,
+        "model_assumed": assumed or record.model is None,
+        "input_tokens": usage.input_tokens,
+        "cached_input_tokens": usage.cached_input_tokens,
+        "noncached_input_tokens": usage.noncached_input_tokens,
+        "output_tokens": usage.output_tokens,
+        "total_tokens": usage.total_tokens,
+        "cost": estimate_cost(usage, rate),
+        "unit": rate.unit,
+    }
+
+
+def sum_sign(value: int) -> str:
+    if value > 0:
+        return f"+{value}"
+    return str(value)
+
+
+def average(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def scan_matches_scope(scan: RolloutScan, target_cwd: Path | None, include_global: bool) -> bool:
+    if include_global:
+        return True
+    return any(path_matches(cwd, target_cwd) for cwd in scan.cwds)
+
+
+def scoped_scans(scans: list[RolloutScan], args: argparse.Namespace, target_cwd: Path | None) -> list[RolloutScan]:
+    include_global = args.scope == "global"
+    return [scan for scan in scans if scan_matches_scope(scan, target_cwd, include_global)]
+
+
+def compaction_windows(
+    scan: RolloutScan,
+    compaction: CompactionRecord,
+    args: argparse.Namespace,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    usages = real_usages_for_scan(scan)
+    before_records = [record for record in usages if record.line_no < compaction.line_no]
+    after_records = [record for record in usages if record.line_no > compaction.line_no]
+    before_window = before_records[-args.compaction_before:] if args.compaction_before > 0 else []
+    after_window = after_records[: args.compaction_after] if args.compaction_after > 0 else []
+    before = [
+        usage_cost_row(record, f"-{len(before_window) - index}", args)
+        for index, record in enumerate(before_window)
+    ]
+    after = [
+        usage_cost_row(record, f"+{index}", args)
+        for index, record in enumerate(after_window, start=1)
+    ]
+    return before, after
+
+
+def cost_average(rows: list[dict[str, Any]]) -> float | None:
+    return average([row["cost"] for row in rows])
+
+
+def token_average(rows: list[dict[str, Any]], key: str) -> float | None:
+    return average([(row.get(key) or 0) for row in rows])
+
+
+def break_even_after_turn(before_avg_cost: float | None, after: list[dict[str, Any]]) -> int | None:
+    if before_avg_cost is None:
+        return None
+    cumulative_delta = 0.0
+    for index, row in enumerate(after, start=1):
+        cumulative_delta += before_avg_cost - row["cost"]
+        if cumulative_delta > 0:
+            return index
+    return None
+
+
+def compaction_analysis_record(
+    scan: RolloutScan,
+    compaction: CompactionRecord,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    before, after = compaction_windows(scan, compaction, args)
+    before_avg_cost = cost_average(before)
+    after_avg_cost = cost_average(after)
+    after_total_cost = sum(row["cost"] for row in after)
+    projected_after_cost = before_avg_cost * len(after) if before_avg_cost is not None else None
+    observed_savings = (
+        projected_after_cost - after_total_cost
+        if projected_after_cost is not None
+        else None
+    )
+    rate, assumed = resolve_rate(compaction.model, args)
+    return {
+        "rollout_path": str(compaction.rollout_path),
+        "session_id": compaction.session_id or scan.session_id,
+        "timestamp": compaction.timestamp,
+        "line_no": compaction.line_no,
+        "marker": compaction.marker,
+        "model": normalize_model(compaction.model) or rate.model,
+        "model_assumed": assumed or compaction.model is None,
+        "replacement_history_len": compaction.replacement_history_len,
+        "context_estimate_tokens": compaction.context_estimate_tokens,
+        "before": before,
+        "after": after,
+        "before_average_cost": before_avg_cost,
+        "after_average_cost": after_avg_cost,
+        "after_total_cost": after_total_cost,
+        "projected_after_cost_without_compaction": projected_after_cost,
+        "observed_savings": observed_savings,
+        "break_even_after_turn": break_even_after_turn(before_avg_cost, after),
+        "before_average_cached_tokens": token_average(before, "cached_input_tokens"),
+        "after_average_cached_tokens": token_average(after, "cached_input_tokens"),
+        "before_average_noncached_tokens": token_average(before, "noncached_input_tokens"),
+        "after_average_noncached_tokens": token_average(after, "noncached_input_tokens"),
+        "unit": rate.unit,
+    }
+
+
+def compaction_analysis_records(
+    scans: list[RolloutScan],
+    args: argparse.Namespace,
+    target_cwd: Path | None,
+) -> list[dict[str, Any]]:
+    scans_by_path = {scan.path: scan for scan in scoped_scans(scans, args, target_cwd)}
+    records = []
+    for compaction in coalesced_compactions(list(scans_by_path.values())):
+        scan = scans_by_path.get(compaction.rollout_path)
+        if scan is None:
+            continue
+        records.append(compaction_analysis_record(scan, compaction, args))
+    return records
+
+
+def rate_entries_for_report(args: argparse.Namespace) -> list[RateEntry]:
+    table = rate_table(args.rate_card)
+    return [table[key] for key in sorted(table)]
+
+
+def rate_card_markdown(args: argparse.Namespace) -> list[str]:
+    lines = [
+        "| model | input / 1M | cached input / 1M | output / 1M | unit |",
+        "| --- | ---: | ---: | ---: | --- |",
+    ]
+    for entry in rate_entries_for_report(args):
+        lines.append(
+            f"| `{entry.model}` | {fmt_float(entry.input_rate, precision=3)} | "
+            f"{fmt_float(entry.cached_input_rate, precision=3)} | "
+            f"{fmt_float(entry.output_rate, precision=3)} | {entry.unit} |"
+        )
+    return lines
+
+
+def rate_source_for_report(args: argparse.Namespace) -> str:
+    if args.rate_card == "api-usd":
+        return OPENAI_API_RATE_SOURCE
+    return OPENAI_CODEX_RATE_SOURCE
 
 
 def recommended_rules(pattern_counts: dict[str, int], high_max_output_count: int) -> list[str]:
@@ -662,6 +1058,124 @@ def report_json(
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
 
+def report_compactions_markdown(
+    scans: list[RolloutScan],
+    args: argparse.Namespace,
+    target_cwd: Path | None,
+) -> str:
+    scoped = scoped_scans(scans, args, target_cwd)
+    parse_errors = sum(scan.parse_errors for scan in scans)
+    records = compaction_analysis_records(scans, args, target_cwd)
+    shown = records[: args.top] if args.top > 0 else records
+    default_rate, _ = resolve_rate(None, args)
+    target = "all sessions" if args.scope == "global" else f"`{target_cwd}`"
+
+    lines = [
+        "# Rollout Compaction Cost Audit",
+        "",
+        f"- Scope: `{args.scope}` ({target})",
+        f"- Sessions root: `{Path(args.sessions_root).expanduser()}`",
+        f"- Since days: `{args.since_days}`",
+        f"- Rollout files scanned: `{len(scans)}`",
+        f"- Rollouts matching scope: `{len(scoped)}`",
+        f"- Compactions found: `{len(records)}`",
+        f"- Window: `{args.compaction_before}` real token_count turns before, `{args.compaction_after}` after",
+        f"- Rate card: `{args.rate_card}`; model: `{args.model}`; default unknown model: `{DEFAULT_MODEL}`",
+    ]
+    if parse_errors:
+        lines.append(f"- JSONL parse errors skipped: `{parse_errors}`")
+    if any(record["model_assumed"] for record in records):
+        lines.append("- Some rows use the default model because the rollout did not expose a model near that turn.")
+    lines.extend(
+        [
+            "",
+            "Cost formula: `(uncached_input * input_rate + cached_input * cached_rate + output * output_rate) / 1,000,000`.",
+            "The zero-token `token_count` emitted immediately after compaction is reported as a context estimate, not billed as a turn.",
+            f"Rates below are static references captured on 2026-06-03; refresh OpenAI pricing before treating this as billing truth. Unit: `{default_rate.unit}`.",
+            f"Rate source: {rate_source_for_report(args)}",
+            "",
+            "## Reference Rate Card",
+            "",
+            *rate_card_markdown(args),
+        ]
+    )
+
+    if not shown:
+        lines.extend(["", "## Compactions", "", "No compaction events found for this scope/window."])
+        return "\n".join(lines) + "\n"
+
+    lines.extend(["", f"## Compactions ({len(shown)} shown)", ""])
+    for index, record in enumerate(shown, start=1):
+        before_avg = record["before_average_cost"]
+        after_avg = record["after_average_cost"]
+        projected = record["projected_after_cost_without_compaction"]
+        observed_savings = record["observed_savings"]
+        break_even = record["break_even_after_turn"]
+        cached_delta = None
+        if record["before_average_cached_tokens"] is not None and record["after_average_cached_tokens"] is not None:
+            cached_delta = record["after_average_cached_tokens"] - record["before_average_cached_tokens"]
+        noncached_delta = None
+        if (
+            record["before_average_noncached_tokens"] is not None
+            and record["after_average_noncached_tokens"] is not None
+        ):
+            noncached_delta = (
+                record["after_average_noncached_tokens"]
+                - record["before_average_noncached_tokens"]
+            )
+
+        lines.extend(
+            [
+                f"### {index}. `{record['session_id'] or '-'}` line {record['line_no']}",
+                "",
+                f"- Marker: `{record['marker']}`; model: `{record['model']}`; rollout: `{record['rollout_path']}`",
+                f"- Post-compaction context estimate: `{fmt_int(record['context_estimate_tokens'])}` tokens",
+                f"- Before avg: `{fmt_float(before_avg)}` {record['unit']} / turn; after avg: `{fmt_float(after_avg)}` {record['unit']} / turn",
+                f"- Observed after-window cost: `{fmt_float(record['after_total_cost'])}` {record['unit']}; projected at before avg: `{fmt_float(projected)}` {record['unit']}; delta: `{fmt_float(observed_savings)}` {record['unit']}",
+                f"- Avg cached-token delta after compaction: `{fmt_float(cached_delta, precision=0)}`; avg noncached-token delta: `{fmt_float(noncached_delta, precision=0)}`",
+                f"- Break-even within observed after-window: `{break_even if break_even is not None else '-'}` turns",
+                "",
+                "| rel | line | input | cached | noncached | output | cost |",
+                "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for row in [*record["before"], *record["after"]]:
+            lines.append(
+                f"| {row['rel']} | {row['line_no']} | {fmt_int(row['input_tokens'])} | "
+                f"{fmt_int(row['cached_input_tokens'])} | {fmt_int(row['noncached_input_tokens'])} | "
+                f"{fmt_int(row['output_tokens'])} | {fmt_float(row['cost'])} |"
+            )
+        lines.append("")
+
+    return "\n".join(lines) + "\n"
+
+
+def report_compactions_json(
+    scans: list[RolloutScan],
+    args: argparse.Namespace,
+    target_cwd: Path | None,
+) -> str:
+    records = compaction_analysis_records(scans, args, target_cwd)
+    payload = {
+        "analysis": "compactions",
+        "scope": args.scope,
+        "cwd": str(target_cwd) if target_cwd else None,
+        "sessions_root": str(Path(args.sessions_root).expanduser()),
+        "since_days": args.since_days,
+        "rollout_files_scanned": len(scans),
+        "rollouts_matching_scope": len(scoped_scans(scans, args, target_cwd)),
+        "compactions_count": len(records),
+        "compaction_before": args.compaction_before,
+        "compaction_after": args.compaction_after,
+        "rate_card": args.rate_card,
+        "model": args.model,
+        "default_model": DEFAULT_MODEL,
+        "rates_per_million": [dataclasses.asdict(entry) for entry in rate_entries_for_report(args)],
+        "compactions": records[: args.top] if args.top > 0 else records,
+    }
+    return json.dumps(payload, indent=2, sort_keys=True) + "\n"
+
+
 def main() -> int:
     args = parse_args()
     sessions_root = Path(args.sessions_root).expanduser()
@@ -680,6 +1194,13 @@ def main() -> int:
         )
         for path in paths
     ]
+    if args.analysis == "compactions":
+        if args.format == "json":
+            sys.stdout.write(report_compactions_json(scans, args, target_cwd))
+        else:
+            sys.stdout.write(report_compactions_markdown(scans, args, target_cwd))
+        return 0
+
     findings = [output for scan in scans for output in scan.outputs]
     findings.sort(
         key=lambda item: (
