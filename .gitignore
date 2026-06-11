@@ -6,9 +6,6 @@
 !.gitignore
 !README.md
 
-!/audit-rollout-outputs/
-!/audit-rollout-outputs/**
-
 !/rollout-output-audit/
 !/rollout-output-audit/**
 
