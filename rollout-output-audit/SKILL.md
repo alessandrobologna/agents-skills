@@ -1,6 +1,6 @@
 ---
 name: rollout-output-audit
-description: Audit Codex session rollout JSONL files for large retained tool outputs that inflate model context, correlate them with token-count events, and recommend scoped AGENTS.md rules. Use when the user asks to analyze Codex session usage, large command output, tool-output bloat, context inflation, compaction cost, or wants rules to reduce future output consumption.
+description: Audit Codex session rollout JSONL files for large retained tool outputs that inflate model context, calculate current token usage for this session, correlate token-count events with compactions, and recommend scoped AGENTS.md rules. Use when the user asks to analyze Codex session usage, calculate current token usage, inspect large command output, reduce tool-output bloat, investigate context inflation, estimate compaction cost, or wants rules to reduce future output consumption.
 ---
 
 # Rollout Output Audit
@@ -15,6 +15,7 @@ Before auditing, determine scope.
 - If the user names a rollout JSONL path, use `--rollout-path <path>` and do not ask for cwd/global scope.
 - If the user names a cwd/path, audit that cwd.
 - If the user explicitly asks for global or machine-wide analysis, audit all sessions.
+- If no scope is named and `CODEX_THREAD_ID` is available, the script defaults to the current Codex session. Use an explicit `--scope current-cwd`, `--scope cwd --cwd <path>`, or `--scope global` to override this.
 - Otherwise ask: "Should I audit only sessions for the current cwd, or all Codex sessions globally?"
 - Recommend current-cwd scope by default; global rollouts may include unrelated private commands, messages, and source snippets.
 
@@ -24,6 +25,7 @@ Before auditing, determine scope.
 
 - Use `--analysis tool-output` to find large retained tool outputs and recommend `AGENTS.md` rules. This is the default.
 - Use `--analysis compactions` when the question is about whether compacting changed per-turn cost or token mix.
+- Use `--analysis token-usage` when the user asks for current token usage, current session token usage, cumulative token usage, or "calculate the current token usage for this session". Report cumulative usage across real model turns first; treat the latest token count as secondary diagnostic context.
 - Use `--analysis both` for broad prompts like "analyze this session" or when the user gives only a session id.
 
 2. Run the bundled audit script.
@@ -56,6 +58,7 @@ python3 "$HOME/.agents/skills/rollout-output-audit/scripts/audit_rollout_outputs
 
 Use `--scope cwd --cwd <path>` for a named path, or `--scope global` for all rollouts. Add `--since-days <N>` when the user requests a time window.
 Exact `--session-id` and `--rollout-path` selectors ignore `--since-days`. Use `--top 0` to include all records.
+When run from inside Codex without explicit selectors or scope arguments, the script uses `CODEX_THREAD_ID` to audit the current session.
 
 For compaction cost analysis:
 
@@ -67,6 +70,16 @@ python3 "$HOME/.agents/skills/rollout-output-audit/scripts/audit_rollout_outputs
   --rate-card codex-credits \
   --model auto
 ```
+
+For current session token usage:
+
+```bash
+python3 "$HOME/.agents/skills/rollout-output-audit/scripts/audit_rollout_outputs.py" \
+  --analysis token-usage
+```
+
+This defaults to `CODEX_THREAD_ID` inside Codex when no explicit session, rollout path, or scope is supplied. Use `--format json` when the caller wants machine-readable fields.
+The primary result is cumulative usage for the session, matching per-request billing shape. It sums real model-turn `token_count` events and excludes zero-token context-estimate events emitted around compaction.
 
 3. Review the compact report.
 - Focus on retained output tokens, high original output counts, repeated command buckets, requested `max_output_tokens`, and the nearest following `token_count`.
@@ -84,6 +97,7 @@ python3 "$HOME/.agents/skills/rollout-output-audit/scripts/audit_rollout_outputs
 - Token counts come from rollout `event_msg` entries with payload type `token_count`, using `last_token_usage`.
 - Compactions are detected from durable `type: "compacted"` rows and nearby UI `context_compacted` events; nearby duplicates are coalesced.
 - The zero-token `token_count` emitted immediately after compaction can expose a new context estimate. Treat it as context size signal, not a billed model turn.
+- Reasoning output tokens are a subset of `output_tokens` in OpenAI usage accounting. Show them separately when helpful, but do not add them again when estimating output cost.
 - Built-in rates are static OpenAI reference values captured on 2026-06-03. Use `--rate-card codex-credits` for Codex credits, `--rate-card api-usd` for API pricing reference, or pass `--input-rate`, `--cached-input-rate`, and `--output-rate` to override per-1M-token rates.
 - Estimates are directional, not exact billing records: they compare observed after-compaction turns against the average cost of the turns immediately before compaction.
 

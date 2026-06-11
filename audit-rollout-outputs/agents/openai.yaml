@@ -1,0 +1,4 @@
+interface:
+  display_name: "Audit Rollout Outputs"
+  short_description: "Alias for rollout output audits"
+  default_prompt: "Use $audit-rollout-outputs to calculate the cumulative current token usage for this session."

@@ -28,7 +28,11 @@ SESSION_ID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
 DEFAULT_MODEL = "gpt-5.3-codex"
-OPENAI_CODEX_RATE_SOURCE = "https://help.openai.com/en/articles/20001106"
+TOKEN_ACCOUNTING_NOTE = (
+    "Reasoning output tokens are included in output_tokens; cost estimates charge "
+    "output_tokens once and do not add reasoning separately."
+)
+OPENAI_CODEX_RATE_SOURCE = "https://help.openai.com/en/articles/20001106-codex-rate-card"
 OPENAI_API_RATE_SOURCE = (
     "https://developers.openai.com/api/docs/models/gpt-5.5, "
     "https://developers.openai.com/api/docs/models/gpt-5.4, "
@@ -177,14 +181,15 @@ class RolloutScan:
 
 
 def parse_args() -> argparse.Namespace:
+    raw_args = sys.argv[1:]
     parser = argparse.ArgumentParser(
         description="Audit Codex rollout JSONL files for large retained tool outputs."
     )
     parser.add_argument(
         "--analysis",
-        choices=("tool-output", "compactions", "both"),
+        choices=("tool-output", "compactions", "token-usage", "both"),
         default="tool-output",
-        help="Analyze large tool outputs, compaction cost, or both.",
+        help="Analyze large tool outputs, compaction cost, current token usage, or both.",
     )
     parser.add_argument(
         "--scope",
@@ -273,6 +278,19 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.top < 0:
         parser.error("--top must be greater than or equal to 0")
+    explicit_scope = any(
+        arg == "--cwd"
+        or arg.startswith("--cwd=")
+        or arg == "--scope"
+        or arg.startswith("--scope=")
+        for arg in raw_args
+    )
+    args.defaulted_to_current_session = False
+    if not args.session_id and not args.rollout_path and not explicit_scope:
+        current_thread_id = os.environ.get("CODEX_THREAD_ID", "").strip()
+        if current_thread_id and SESSION_ID_RE.fullmatch(current_thread_id):
+            args.session_id = [current_thread_id.lower()]
+            args.defaulted_to_current_session = True
     return args
 
 
@@ -745,6 +763,7 @@ def fmt_usage(usage: TokenUsage | None) -> str:
         f"cached={fmt_int(usage.cached_input_tokens)}",
         f"noncached={fmt_int(usage.noncached_input_tokens)}",
         f"output={fmt_int(usage.output_tokens)}",
+        f"reasoning_in_output={fmt_int(usage.reasoning_output_tokens)}",
         f"total={fmt_int(usage.total_tokens)}",
     ]
     return "next token_count: " + ", ".join(parts)
@@ -838,9 +857,58 @@ def usage_cost_row(record: UsageRecord, rel: str, args: argparse.Namespace) -> d
         "cached_input_tokens": usage.cached_input_tokens,
         "noncached_input_tokens": usage.noncached_input_tokens,
         "output_tokens": usage.output_tokens,
+        "reasoning_output_tokens": usage.reasoning_output_tokens,
         "total_tokens": usage.total_tokens,
         "cost": estimate_cost(usage, rate),
         "unit": rate.unit,
+    }
+
+
+def usage_snapshot(record: UsageRecord, args: argparse.Namespace) -> dict[str, Any]:
+    rate, assumed = resolve_rate(record.model, args)
+    usage = record.usage
+    return {
+        "rollout_path": str(record.rollout_path),
+        "session_id": record.session_id,
+        "timestamp": record.timestamp,
+        "line_no": record.line_no,
+        "model": normalize_model(record.model) or rate.model,
+        "model_assumed": assumed or record.model is None,
+        "input_tokens": usage.input_tokens,
+        "cached_input_tokens": usage.cached_input_tokens,
+        "noncached_input_tokens": usage.noncached_input_tokens,
+        "output_tokens": usage.output_tokens,
+        "reasoning_output_tokens": usage.reasoning_output_tokens,
+        "total_tokens": usage.total_tokens,
+        "model_context_window": usage.model_context_window,
+        "is_real_turn": record.is_real_turn,
+        "estimated_cost": estimate_cost(usage, rate),
+        "unit": rate.unit,
+    }
+
+
+def cumulative_usage_snapshot(records: list[UsageRecord], args: argparse.Namespace) -> dict[str, Any]:
+    total_cost = 0.0
+    units: set[str] = set()
+    for record in records:
+        rate, _ = resolve_rate(record.model, args)
+        total_cost += estimate_cost(record.usage, rate)
+        units.add(rate.unit)
+
+    return {
+        "turn_count": len(records),
+        "input_tokens": sum((record.usage.input_tokens or 0) for record in records),
+        "cached_input_tokens": sum((record.usage.cached_input_tokens or 0) for record in records),
+        "noncached_input_tokens": sum((record.usage.noncached_input_tokens or 0) for record in records),
+        "output_tokens": sum((record.usage.output_tokens or 0) for record in records),
+        "reasoning_output_tokens": sum((record.usage.reasoning_output_tokens or 0) for record in records),
+        "total_tokens": sum((record.usage.total_tokens or 0) for record in records),
+        "estimated_cost": total_cost,
+        "unit": next(iter(units)) if len(units) == 1 else "mixed",
+        "first_line_no": records[0].line_no if records else None,
+        "first_timestamp": records[0].timestamp if records else None,
+        "last_line_no": records[-1].line_no if records else None,
+        "last_timestamp": records[-1].timestamp if records else None,
     }
 
 
@@ -885,6 +953,27 @@ def scan_matches_scope(scan: RolloutScan, target_cwd: Path | None, include_globa
 def scoped_scans(scans: list[RolloutScan], args: argparse.Namespace, target_cwd: Path | None) -> list[RolloutScan]:
     include_global = args.scope == "global" or exact_selector_active(args)
     return [scan for scan in scans if scan_matches_scope(scan, target_cwd, include_global)]
+
+
+def usage_sort_key(record: UsageRecord) -> tuple[str, float, int]:
+    try:
+        mtime = record.rollout_path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    return (record.timestamp or "", mtime, record.line_no)
+
+
+def usage_records_for_scope(
+    scans: list[RolloutScan],
+    args: argparse.Namespace,
+    target_cwd: Path | None,
+) -> list[UsageRecord]:
+    records = [
+        record
+        for scan in scoped_scans(scans, args, target_cwd)
+        for record in scan.usages
+    ]
+    return sorted(records, key=usage_sort_key)
 
 
 def compaction_windows(
@@ -1101,9 +1190,12 @@ def report_markdown(
         f"- Findings above threshold: `{len(findings)}`",
         f"- Findings shown: `{len(shown_findings)}`",
         f"- Large-output threshold: `{args.large_output_tokens:,}` approximate tokens",
+        f"- Token accounting: {TOKEN_ACCOUNTING_NOTE}",
     ]
     if exact_selector_active(args):
         lines.append("- Exact session/rollout selectors ignore the since-days window.")
+    if args.defaulted_to_current_session:
+        lines.append("- Default selector: current `CODEX_THREAD_ID`.")
     if parse_errors:
         lines.append(f"- JSONL parse errors skipped: `{parse_errors}`")
     if target:
@@ -1167,6 +1259,7 @@ def report_json(
         "session_ids": args.session_id,
         "rollout_path_selectors": args.rollout_path,
         "exact_selectors_ignore_since_days": exact_selector_active(args),
+        "defaulted_to_current_session": args.defaulted_to_current_session,
         "sessions_root": str(Path(args.sessions_root).expanduser()),
         "since_days": args.since_days,
         "rollout_files_scanned": len(scans),
@@ -1174,6 +1267,7 @@ def report_json(
         "findings_count": len(findings),
         "findings_shown_count": len(limited_items(findings, args)),
         "large_output_threshold_tokens": args.large_output_tokens,
+        "token_accounting_note": TOKEN_ACCOUNTING_NOTE,
         "pattern_summary": pattern_counts,
         "recommended_rules": recommended_rules(pattern_counts, high_max_output_count),
         "findings": [
@@ -1224,6 +1318,8 @@ def report_compactions_markdown(
     ]
     if exact_selector_active(args):
         lines.append("- Exact session/rollout selectors ignore the since-days window.")
+    if args.defaulted_to_current_session:
+        lines.append("- Default selector: current `CODEX_THREAD_ID`.")
     if parse_errors:
         lines.append(f"- JSONL parse errors skipped: `{parse_errors}`")
     if any(record["model_assumed"] for record in records):
@@ -1232,6 +1328,7 @@ def report_compactions_markdown(
         [
             "",
             "Cost formula: `(uncached_input * input_rate + cached_input * cached_rate + output * output_rate) / 1,000,000`.",
+            f"Token accounting: {TOKEN_ACCOUNTING_NOTE}",
             "The zero-token `token_count` emitted immediately after compaction is reported as a context estimate, not billed as a turn.",
             f"Rates below are static references captured on 2026-06-03; refresh OpenAI pricing before treating this as billing truth. Unit: `{default_rate.unit}`.",
             f"Rate source: {rate_source_for_report(args)}",
@@ -1278,15 +1375,16 @@ def report_compactions_markdown(
                 f"- Avg cached-token delta after compaction: `{fmt_float(cached_delta, precision=0)}`; avg noncached-token delta: `{fmt_float(noncached_delta, precision=0)}`",
                 f"- Break-even within observed after-window: `{break_even if break_even is not None else '-'}` turns",
                 "",
-                "| rel | line | input | cached | noncached | output | cost |",
-                "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+                "| rel | line | input | cached | noncached | output | reasoning in output | cost |",
+                "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             ]
         )
         for row in [*record["before"], *record["after"]]:
             lines.append(
                 f"| {row['rel']} | {row['line_no']} | {fmt_int(row['input_tokens'])} | "
                 f"{fmt_int(row['cached_input_tokens'])} | {fmt_int(row['noncached_input_tokens'])} | "
-                f"{fmt_int(row['output_tokens'])} | {fmt_float(row['cost'])} |"
+                f"{fmt_int(row['output_tokens'])} | {fmt_int(row['reasoning_output_tokens'])} | "
+                f"{fmt_float(row['cost'])} |"
             )
         lines.append("")
 
@@ -1307,6 +1405,7 @@ def report_compactions_json(
         "session_ids": args.session_id,
         "rollout_path_selectors": args.rollout_path,
         "exact_selectors_ignore_since_days": exact_selector_active(args),
+        "defaulted_to_current_session": args.defaulted_to_current_session,
         "sessions_root": str(Path(args.sessions_root).expanduser()),
         "since_days": args.since_days,
         "rollout_files_scanned": len(scans),
@@ -1319,8 +1418,168 @@ def report_compactions_json(
         "rate_card": args.rate_card,
         "model": args.model,
         "default_model": DEFAULT_MODEL,
+        "token_accounting_note": TOKEN_ACCOUNTING_NOTE,
         "rates_per_million": [dataclasses.asdict(entry) for entry in rate_entries_for_report(args)],
         "compactions": shown,
+    }
+    return json.dumps(payload, indent=2, sort_keys=True) + "\n"
+
+
+def token_usage_summary(
+    scans: list[RolloutScan],
+    args: argparse.Namespace,
+    target_cwd: Path | None,
+) -> dict[str, Any]:
+    scoped = scoped_scans(scans, args, target_cwd)
+    records = usage_records_for_scope(scans, args, target_cwd)
+    real_records = [record for record in records if record.is_real_turn]
+    latest = records[-1] if records else None
+    latest_real = real_records[-1] if real_records else None
+    cumulative = cumulative_usage_snapshot(real_records, args)
+    return {
+        "scoped_rollouts": scoped,
+        "records": records,
+        "real_records": real_records,
+        "latest": latest,
+        "latest_real": latest_real,
+        "cumulative": cumulative,
+    }
+
+
+def report_token_usage_markdown(
+    scans: list[RolloutScan],
+    args: argparse.Namespace,
+    target_cwd: Path | None,
+) -> str:
+    summary = token_usage_summary(scans, args, target_cwd)
+    records = summary["records"]
+    real_records = summary["real_records"]
+    cumulative = summary["cumulative"]
+    latest = summary["latest"]
+    latest_real = summary["latest_real"]
+    parse_errors = sum(scan.parse_errors for scan in scans)
+    default_rate, _ = resolve_rate(None, args)
+
+    lines = [
+        "# Rollout Token Usage Audit",
+        "",
+        f"- Scope: `{args.scope}` ({scope_target_label(args, target_cwd)})",
+        f"- Sessions root: `{Path(args.sessions_root).expanduser()}`",
+        f"- Since days: `{args.since_days}`",
+        f"- Rollout files scanned: `{len(scans)}`",
+        f"- Rollouts matching scope: `{len(summary['scoped_rollouts'])}`",
+        f"- Token count events: `{len(records)}`",
+        f"- Real model turns: `{len(real_records)}`",
+        f"- Rate card: `{args.rate_card}`; model: `{args.model}`; default unknown model: `{DEFAULT_MODEL}`",
+    ]
+    if exact_selector_active(args):
+        lines.append("- Exact session/rollout selectors ignore the since-days window.")
+    if args.defaulted_to_current_session:
+        lines.append("- Default selector: current `CODEX_THREAD_ID`.")
+    if parse_errors:
+        lines.append(f"- JSONL parse errors skipped: `{parse_errors}`")
+
+    lines.extend(
+        [
+            "",
+            "Cost formula: `(uncached_input * input_rate + cached_input * cached_rate + output * output_rate) / 1,000,000`.",
+            f"Token accounting: {TOKEN_ACCOUNTING_NOTE}",
+            f"Rates are directional estimates. Unit: `{default_rate.unit}`.",
+            f"Rate source: {rate_source_for_report(args)}",
+        ]
+    )
+
+    if not real_records:
+        lines.extend(["", "No `token_count` events found for this scope/window."])
+        return "\n".join(lines) + "\n"
+
+    lines.extend(
+        [
+            "",
+            "## Cumulative Usage",
+            "",
+            "| turns | input | cached | noncached | output | reasoning in output | total | estimated cost |",
+            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            f"| {fmt_int(cumulative['turn_count'])} | {fmt_int(cumulative['input_tokens'])} | "
+            f"{fmt_int(cumulative['cached_input_tokens'])} | {fmt_int(cumulative['noncached_input_tokens'])} | "
+            f"{fmt_int(cumulative['output_tokens'])} | {fmt_int(cumulative['reasoning_output_tokens'])} | "
+            f"{fmt_int(cumulative['total_tokens'])} | {fmt_float(cumulative['estimated_cost'])} |",
+            "",
+            "Cumulative usage sums real model-turn `token_count` events. If a rollout contains zero-token context-estimate events after compaction, those are excluded from the cumulative cost estimate.",
+        ]
+    )
+
+    lines.extend(
+        [
+            "",
+            "## Latest Snapshot",
+            "",
+            "| kind | line | input | cached | noncached | output | reasoning in output | total | context window | cost |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    rows = [("latest token_count", usage_snapshot(latest, args))]
+    if latest_real is not None and latest_real.line_no != latest.line_no:
+        rows.append(("latest real turn", usage_snapshot(latest_real, args)))
+    for label, row in rows:
+        lines.append(
+            f"| {label} | {row['line_no']} | {fmt_int(row['input_tokens'])} | "
+            f"{fmt_int(row['cached_input_tokens'])} | {fmt_int(row['noncached_input_tokens'])} | "
+            f"{fmt_int(row['output_tokens'])} | {fmt_int(row['reasoning_output_tokens'])} | "
+            f"{fmt_int(row['total_tokens'])} | {fmt_int(row['model_context_window'])} | "
+            f"{fmt_float(row['estimated_cost'])} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            f"- Latest rollout: `{latest.rollout_path}:{latest.line_no}`",
+            f"- Latest timestamp: `{latest.timestamp or '-'}`",
+        ]
+    )
+    if latest_real is not None and latest_real.line_no != latest.line_no:
+        lines.append(
+            "- Latest `token_count` is not a real model turn; the separate latest real turn row is the latest billed-turn estimate."
+        )
+
+    return "\n".join(lines) + "\n"
+
+
+def report_token_usage_json(
+    scans: list[RolloutScan],
+    args: argparse.Namespace,
+    target_cwd: Path | None,
+) -> str:
+    summary = token_usage_summary(scans, args, target_cwd)
+    latest = summary["latest"]
+    latest_real = summary["latest_real"]
+    recent_records = list(reversed(summary["records"]))
+    payload = {
+        "analysis": "token-usage",
+        "scope": args.scope,
+        "cwd": str(target_cwd) if target_cwd else None,
+        "session_ids": args.session_id,
+        "rollout_path_selectors": args.rollout_path,
+        "exact_selectors_ignore_since_days": exact_selector_active(args),
+        "defaulted_to_current_session": args.defaulted_to_current_session,
+        "sessions_root": str(Path(args.sessions_root).expanduser()),
+        "since_days": args.since_days,
+        "rollout_files_scanned": len(scans),
+        "rollouts_matching_scope": len(summary["scoped_rollouts"]),
+        "token_count_events": len(summary["records"]),
+        "real_turn_events": len(summary["real_records"]),
+        "rate_card": args.rate_card,
+        "rate_source": rate_source_for_report(args),
+        "model": args.model,
+        "default_model": DEFAULT_MODEL,
+        "token_accounting_note": TOKEN_ACCOUNTING_NOTE,
+        "cumulative_token_usage": summary["cumulative"],
+        "latest_token_count": usage_snapshot(latest, args) if latest else None,
+        "latest_real_turn": usage_snapshot(latest_real, args) if latest_real else None,
+        "recent_token_counts": [
+            usage_snapshot(record, args)
+            for record in limited_items(recent_records, args)
+        ],
     }
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
@@ -1401,6 +1660,13 @@ def main() -> int:
             sys.stdout.write(report_compactions_json(scans, args, target_cwd))
         else:
             sys.stdout.write(report_compactions_markdown(scans, args, target_cwd))
+        return 0
+
+    if args.analysis == "token-usage":
+        if args.format == "json":
+            sys.stdout.write(report_token_usage_json(scans, args, target_cwd))
+        else:
+            sys.stdout.write(report_token_usage_markdown(scans, args, target_cwd))
         return 0
 
     if args.format == "json":
